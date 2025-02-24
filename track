@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 import cv2
 import numpy as np
-import pandas as pd
 import struct
 import time
 from scipy.ndimage import gaussian_filter
 import matplotlib.pyplot as plt
 
-###############################################################################
-#                          Core CINE Processing Functions                     #
-###############################################################################
+##############################################################################
+#                          CINE File Reading Functions                       #
+##############################################################################
 
 def read_L(f):
     return int(struct.unpack('<l', f.read(4))[0])
@@ -58,7 +57,7 @@ def read_cine(ifn):
         pps = read_L(cf)
         exposure = read_L(cf)
 
-        cf.seek(int(pointers[2])
+        cf.seek(int(pointers[2]))
         pimage = read_Q_array(cf, image_count)
 
         dtype = 'B' if nbit == 8 else 'H'
@@ -81,157 +80,175 @@ def read_cine(ifn):
         print("Done reading .cine file (%.1f s)" % (time.time() - t_read))
         return time_arr, frame_arr
 
-###############################################################################
-#                           Video Conversion Functions                        #
-###############################################################################
+##############################################################################
+#                          Video Processing Functions                        #
+##############################################################################
 
-def convert_cine_to_avi(cine_path, avi_path, scale_factor=8):
-    """Convert CINE file to AVI video with scaling"""
-    time_arr, frame_arr = read_cine(cine_path)
-    
-    # Get original dimensions
+def convert_cine_to_avi(frame_arr, avi_path, scale_factor=8):
+    """Convert CINE frame array to AVI video"""
     orig_height, orig_width = frame_arr.shape[1], frame_arr.shape[2]
-    target_resolution = (orig_height * scale_factor, orig_width * scale_factor)
     
-    # Create VideoWriter
     fourcc = cv2.VideoWriter_fourcc(*'MJPG')
     out = cv2.VideoWriter(avi_path, fourcc, 30, 
-                         (target_resolution[1], target_resolution[0]), False)
+                        (orig_width*scale_factor, orig_height*scale_factor), False)
 
-    print(f"Converting {cine_path} to {avi_path}...")
+    print(f"Converting to {avi_path}...")
     for frame in frame_arr:
-        normalized = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX)
-        resized = cv2.resize(normalized.astype(np.uint8), 
-                            (target_resolution[1], target_resolution[0]))
+        norm_frame = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX)
+        resized = cv2.resize(norm_frame.astype(np.uint8), 
+                           (orig_width*scale_factor, orig_height*scale_factor))
         out.write(resized)
     
     out.release()
     print(f"Conversion complete. Saved to {avi_path}")
 
-###############################################################################
-#                            Time Calibration Functions                       #
-###############################################################################
-
-def load_experimental_time(csv_path):
-    """Load experimental time data from CSV"""
-    data = pd.read_csv(csv_path, header=None, skiprows=2)
-    return data.iloc[:, 0].values
-
-def video_time_to_experiment_time(video_time, fps, time_arr):
-    """Convert video time to experimental timeline"""
-    frame_index = int(video_time * fps)
-    if frame_index < 0 or frame_index >= len(time_arr):
-        raise ValueError(f"Video time {video_time}s out of range!")
-    return time_arr[frame_index]
-
-###############################################################################
-#                            Tracking Processing Functions                    #
-###############################################################################
-
-def track_object_in_video(video_path, time_arr, output_prefix):
-    """Main tracking function with all processing steps"""
-    cap = cv2.VideoCapture(video_path)
+def track_object(avi_path, output_prefix, time_arr):
+    """Main tracking function using CINE timing data"""
+    cap = cv2.VideoCapture(avi_path)
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     
     # Skip to 6 seconds
-    cap.set(cv2.CAP_PROP_POS_FRAMES, fps * 6)
+    start_frame = fps * 6
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     ret, initial_frame = cap.read()
-    
-    # ROI Selection
+    if not ret:
+        print("Error: Couldn't read initial frame!")
+        cap.release()
+        return
+
+    # Manual calibration
     cv2.imshow("Select Calibration Object", initial_frame)
     calib_roi = cv2.selectROI("Select Calibration Object", initial_frame, False)
     cv2.destroyAllWindows()
-    
-    # Length calibration
     calib_w, calib_h = calib_roi[2], calib_roi[3]
     real_length = float(input("Real-world length of selected object (meters): "))
     pixels_per_meter = max(calib_w, calib_h) / real_length
-    
+
     # Tracking setup
-    cv2.imshow("Select Tracking Object", initial_frame)
-    track_roi = cv2.selectROI("Select Tracking Object", initial_frame, False)
+    cv2.imshow("Select Object to Track", initial_frame)
+    track_roi = cv2.selectROI("Select Object to Track", initial_frame, False)
     cv2.destroyAllWindows()
     x, y, w, h = track_roi
     template = initial_frame[y:y+h, x:x+w]
     template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
-    
+
+    # Search area selection
+    cv2.imshow("Select Search Area", initial_frame)
+    range_roi = cv2.selectROI("Select Search Area", initial_frame, False)
+    cv2.destroyAllWindows()
+    range_x, range_y, range_w, range_h = range_roi
+
     # Tracking parameters
     composite = initial_frame.copy().astype(np.float32)
+    alpha = 0.3
+    current_pos = (x + w//2, y + h//2)
+    frame_height, frame_width = initial_frame.shape[:2]
+    center_x, center_y = frame_width // 2, frame_height // 2
+
     time_list, x_list, y_list = [], [], []
-    frame_count = fps * 6
-    
-    # Main tracking loop
+    frame_count = start_frame
+
     while cap.isOpened():
         ret, frame = cap.read()
-        if not ret:
+        if not ret: 
             break
-        
-        if frame_count % 30 == 0:
-            # Tracking logic
-            pass  # Maintain original tracking code here
-        
-        # Visualization and display
-        pass  # Maintain original visualization code here
-    
-    # Post-processing
+
+        current_frame_index = frame_count
+        frame_count += 1
+
+        display_frame = frame.copy()
+        cv2.rectangle(display_frame, (range_x, range_y), 
+                      (range_x + range_w, range_y + range_h), (255,0,0), 2)
+
+        if (current_frame_index - start_frame) % 30 == 0:
+            search_region = frame[range_y:range_y+range_h, range_x:range_x+range_w]
+            res = cv2.matchTemplate(cv2.cvtColor(search_region, cv2.COLOR_BGR2GRAY),
+                                   template_gray, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+            
+            if max_val > 0.7:
+                match_x = range_x + max_loc[0] + w//2
+                match_y = range_y + max_loc[1] + h//2
+                current_pos = (match_x, match_y)
+                
+                # Store data with experimental time
+                time_list.append(time_arr[current_frame_index])
+                x_list.append((match_x - center_x)/pixels_per_meter)
+                y_list.append((center_y - match_y)/pixels_per_meter)
+                
+                # Update composite
+                x1 = max(0, match_x - w//2)
+                y1 = max(0, match_y - h//2)
+                x2 = min(frame_width, match_x + w//2)
+                y2 = min(frame_height, match_y + h//2)
+                composite[y1:y2, x1:x2] = cv2.addWeighted(
+                    composite[y1:y2, x1:x2], 1-alpha,
+                    frame[y1:y2, x1:x2].astype(np.float32), alpha, 0)
+
+        # Draw tracking visualization
+        cv2.circle(display_frame, current_pos, 10, (0,0,255), -1)
+        cv2.imshow("Live Tracking", display_frame)
+        cv2.imshow("Composite", composite.astype(np.uint8))
+        if cv2.waitKey(30) & 0xFF == 27: 
+            break
+
     cap.release()
     cv2.destroyAllWindows()
-    
-    # Save results
-    np.savez(f"{output_prefix}_tracking.npz",
-             times=np.array(time_list),
-             x_pos=np.array(x_list),
-             y_pos=np.array(y_list))
+    cv2.imwrite(f"{output_prefix}_composite.png", composite.astype(np.uint8))
+
+    # Convert to arrays and save
+    time_array = np.array(time_list)
+    x_array = np.array(x_list)
+    y_array = np.array(y_list)
+
+    np.savez(f"{output_prefix}_results.npz",
+             time=time_array,
+             x=x_array,
+             y=y_array)
     
     # Generate plots
     plt.figure(figsize=(15,5))
-    # ... plotting code ...
+    
+    plt.subplot(131)
+    plt.scatter(x_array, y_array, c=time_array, cmap='viridis')
+    plt.colorbar(label='Experimental Time (s)')
+    plt.xlabel('X Position (m)')
+    plt.ylabel('Y Position (m)')
+    plt.title('Object Trajectory')
+    
+    plt.subplot(132)
+    plt.plot(time_array, x_array)
+    plt.xlabel('Experimental Time (s)')
+    plt.ylabel('X Position (m)')
+    plt.title('X Position vs Time')
+    
+    plt.subplot(133)
+    plt.plot(time_array, y_array)
+    plt.xlabel('Experimental Time (s)')
+    plt.ylabel('Y Position (m)')
+    plt.title('Y Position vs Time')
+    
+    plt.tight_layout()
     plt.savefig(f"{output_prefix}_plots.png")
     plt.close()
+    
+    print(f"Processing complete for {avi_path}")
 
-###############################################################################
-#                            Batch Processing Function                        #
-###############################################################################
-
-def process_cine_dataset(cine_files, csv_files, output_dir="results"):
-    """
-    Process multiple CINE files with experimental data
-    :param cine_files: List of paths to CINE files
-    :param csv_files: List of paths to CSV time data files
-    :param output_dir: Output directory for results
-    """
-    for cine_path, csv_path in zip(cine_files, csv_files):
-        # Generate output prefixes
-        base_name = os.path.basename(cine_path).split('.')[0]
-        output_prefix = os.path.join(output_dir, base_name)
-        
-        # Convert CINE to AVI
-        avi_path = f"{output_prefix}.avi"
-        convert_cine_to_avi(cine_path, avi_path)
-        
-        # Load experimental time data
-        time_arr = load_experimental_time(csv_path)
-        
-        # Run tracking
-        track_object_in_video(avi_path, time_arr, output_prefix)
-        
-        print(f"Completed processing for {cine_path}")
-
-###############################################################################
-#                                Example Usage                                #
-###############################################################################
+##############################################################################
+#                              Main Execution                                #
+##############################################################################
 
 if __name__ == '__main__':
-    # Example file list
-    cine_files = [
-        "Y20241101_He3kA_B250G500G_pl0t20_uw17t27_P24_y0@100_009.cine",
-        "Y20241101_He3kA_B250G500G_pl0t20_uw17t27_P24_y0@100_010.cine"
-    ]
+    # Process single file example
+    cine_path = "Y20241101_He3kA_B250G500G_pl0t20_uw17t27_P24_y0@100_009.cine"
+    avi_path = "output_video.avi"
+    output_prefix = "tracking_results"
     
-    csv_files = [
-        "Tungsten_ball_009.csv",
-        "Tungsten_ball_010.csv"
-    ]
+    # Read CINE file
+    time_arr, frame_arr = read_cine(cine_path)
     
-    # Process all files
-    process_cine_dataset(cine_files, csv_files, output_dir="results")
+    # Convert CINE to AVI
+    convert_cine_to_avi(frame_arr, avi_path)
+    
+    # Track object and save results
+    track_object(avi_path, output_prefix, time_arr)
