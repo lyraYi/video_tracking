@@ -1,0 +1,26 @@
+
+##############################################################################
+#                              Main Execution                                #
+##############################################################################
+
+if __name__ == '__main__':
+    # Create output directory
+    os.makedirs("output", exist_ok=True)
+    
+    # File paths
+    cine_path = "Y20241101_He3kA_B250G500G_pl0t20_uw17t27_P24_y0@100_009.cine"
+    avi_path = "output_video.avi"
+    output_prefix = "output/tracking_results"
+
+    try:
+        # Read CINE file with frame rate information
+        time_arr, frame_arr = read_cine(cine_path)
+        
+        # Convert to AVI
+        convert_cine_to_avi(frame_arr, avi_path)
+        
+        # Track object through entire video
+        track_object(avi_path, output_prefix, time_arr)
+        
+    except Exception as e:
+        print(f"Error processing file: {str(e)}")
