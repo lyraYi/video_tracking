@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
 import cv2
 import numpy as np
 import struct
 import time
-from scipy.ndimage import gaussian_filter
 import matplotlib.pyplot as plt
+import os
 
 ##############################################################################
 #                          CINE File Reading Functions                       #
@@ -97,158 +96,222 @@ def convert_cine_to_avi(frame_arr, avi_path, scale_factor=8):
         norm_frame = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX)
         resized = cv2.resize(norm_frame.astype(np.uint8), 
                            (orig_width*scale_factor, orig_height*scale_factor))
-        out.write(resized)
+        flipped = cv2.flip(resized, 0)  # Flip vertically
+        out.write(flipped)
     
     out.release()
     print(f"Conversion complete. Saved to {avi_path}")
 
-def track_object(avi_path, output_prefix, time_arr):
-    """Main tracking function using CINE timing data"""
-    cap = cv2.VideoCapture(avi_path)
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
+def detect_chamber(frame, calibration):
+    """
+    Detects the bright chamber circle using optimized thresholding and validation.
+    """
+    # Convert physical radius constraints (6-8cm in pixels)
+    min_radius_px = int(6 / calibration)
+    max_radius_px = int(8 / calibration)
+
+    # Convert to grayscale and enhance contrast
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     
-    # Skip to 6 seconds
-    start_frame = fps * 6
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    # Optimized preprocessing for bright circles
+    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+    _, thresh = cv2.threshold(blurred, 200, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Morphological closing to enhance circular shape
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    
+    # Detect circles with optimized parameters
+    circles = cv2.HoughCircles(
+        closed,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=frame.shape[1]//2,  # Assume only one main chamber
+        param1=150,  # Lower Canny threshold
+        param2=25,   # Accumulator threshold (lower for better detection)
+        minRadius=min_radius_px,
+        maxRadius=max_radius_px
+    )
+
+    # Validate and select best candidate
+    best_circle = None
+    if circles is not None:
+        circles = np.int32(np.around(circles))[0]
+        
+        # Score circles by brightness and circularity
+        for circle in circles:
+            x, y, r = circle
+            if x-r < 0 or y-r < 0 or x+r > frame.shape[1] or y+r > frame.shape[0]:
+                continue  # Skip edge-touching circles
+            
+            # Create mask for brightness verification
+            mask = np.zeros_like(gray)
+            cv2.circle(mask, (x, y), r, 255, -1)
+            mean_brightness = cv2.mean(gray, mask=mask)[0]
+            
+            # Circularity check
+            contour = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+            perimeter = cv2.arcLength(contour[0], True)
+            circularity = 4 * np.pi * (cv2.contourArea(contour[0])) / (perimeter ** 2)
+            
+            if circularity > 0.85 and mean_brightness > 200:
+                if best_circle is None or r > best_circle[2]:
+                    best_circle = (x, y, r)
+
+    # Fallback to contour detection if Hough fails
+    if best_circle is None:
+        print("Hough failed, using contour fallback")
+        contours = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+        if contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+            (x, y), r = cv2.minEnclosingCircle(largest_contour)
+            best_circle = (int(x), int(y), int(r))
+
+    # Final validation
+    if best_circle:
+        x, y, r = best_circle
+        origin = (x, y)
+        radius = r
+    else:
+        print("Warning: No valid circle found, using frame center")
+        origin = (frame.shape[1]//2, frame.shape[0]//2)
+        radius = int((min_radius_px + max_radius_px)/2)
+
+    # Visualization (save intermediate steps)
+    debug_img = cv2.cvtColor(closed, cv2.COLOR_GRAY2BGR)
+    cv2.circle(debug_img, origin, radius, (0,255,0), 2)
+    cv2.imwrite("chamber_debug.png", debug_img)
+
+    print(f"Chamber detected at {origin} with radius {radius}px")
+    return origin, radius
+def track_object(avi_path, output_prefix, time_arr):
+    """Track tungsten ball through entire video sequence"""
+    # Constants
+    CALIBRATION = 0.038  # cm/pixel
+    MIN_DIAMETER_MM = 1   # Tungsten ball diameter
+    MAX_DIAMETER_MM = 3
+    PIXELS_PER_METER = 100 / CALIBRATION  # Assuming CALIBRATION is in cm/pixel
+
+    # Initialize video capture
+    cap = cv2.VideoCapture(avi_path)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video file: {avi_path}")
+
+    # Detect chamber in first frame
     ret, initial_frame = cap.read()
     if not ret:
-        print("Error: Couldn't read initial frame!")
-        cap.release()
-        return
+        raise ValueError("Could not read first frame for chamber detection")
 
-    # Manual calibration
-    cv2.imshow("Select Calibration Object", initial_frame)
-    calib_roi = cv2.selectROI("Select Calibration Object", initial_frame, False)
-    cv2.destroyAllWindows()
-    calib_w, calib_h = calib_roi[2], calib_roi[3]
-    real_length = float(input("Real-world length of selected object (meters): "))
-    pixels_per_meter = max(calib_w, calib_h) / real_length
+    (cx, cy), chamber_radius = detect_chamber(initial_frame, PIXELS_PER_METER)
+    
+    # Save chamber visualization
+    chamber_vis = initial_frame.copy()
+    cv2.circle(chamber_vis, (cx, cy), chamber_radius, (0, 255, 0), 2)
+    cv2.imwrite(f"{output_prefix}_chamber_detection.png", chamber_vis)
 
-    # Tracking setup
-    cv2.imshow("Select Object to Track", initial_frame)
-    track_roi = cv2.selectROI("Select Object to Track", initial_frame, False)
-    cv2.destroyAllWindows()
-    x, y, w, h = track_roi
-    template = initial_frame[y:y+h, x:x+w]
-    template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+    # Prepare tracking data structures
+    positions = []
+    frame_numbers = []
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Search area selection
-    cv2.imshow("Select Search Area", initial_frame)
-    range_roi = cv2.selectROI("Select Search Area", initial_frame, False)
-    cv2.destroyAllWindows()
-    range_x, range_y, range_w, range_h = range_roi
-
-    # Tracking parameters
-    composite = initial_frame.copy().astype(np.float32)
-    alpha = 0.3
-    current_pos = (x + w//2, y + h//2)
-    frame_height, frame_width = initial_frame.shape[:2]
-    center_x, center_y = frame_width // 2, frame_height // 2
-
-    time_list, x_list, y_list = [], [], []
-    frame_count = start_frame
-
-    while cap.isOpened():
+    # Process all frames
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    for frame_idx in range(total_frames):
         ret, frame = cap.read()
-        if not ret: 
+        if not ret:
             break
 
-        current_frame_index = frame_count
-        frame_count += 1
+        # Detect ball position
+        mask = np.zeros_like(frame[:,:,0])
+        cv2.circle(mask, (cx, cy), chamber_radius, 255, -1)
+        masked_frame = cv2.bitwise_and(frame, frame, mask=mask)
+        
+        gray = cv2.cvtColor(masked_frame, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5,5), 0)
+        inverted = 255 - blurred
 
-        display_frame = frame.copy()
-        cv2.rectangle(display_frame, (range_x, range_y), 
-                      (range_x + range_w, range_y + range_h), (255,0,0), 2)
+        # Correct radius calculation (using radius instead of diameter)
+        min_radius = int((MIN_DIAMETER_MM/10)/CALIBRATION)  # 0.1cm
+        max_radius = int((MAX_DIAMETER_MM/10)/CALIBRATION)  # 0.3cm
+        
+        circles = cv2.HoughCircles(
+            inverted,
+            cv2.HOUGH_GRADIENT,
+            dp=1,
+            minDist=chamber_radius//4,
+            param1=50,
+            param2=12,
+            minRadius=min_radius,
+            maxRadius=max_radius
+        )
 
-        if (current_frame_index - start_frame) % 30 == 0:
-            search_region = frame[range_y:range_y+range_h, range_x:range_x+range_w]
-            res = cv2.matchTemplate(cv2.cvtColor(search_region, cv2.COLOR_BGR2GRAY),
-                                   template_gray, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        if circles is not None:
+            circles = np.int32(np.around(circles[0]))
+            valid = []
+            for c in circles:
+                # Validate position within chamber
+                if np.hypot(c[0] - cx, c[1] - cy) < chamber_radius * 0.9:
+                    valid.append(c)
             
-            if max_val > 0.7:
-                match_x = range_x + max_loc[0] + w//2
-                match_y = range_y + max_loc[1] + h//2
-                current_pos = (match_x, match_y)
+            if valid:
+                # Select brightest candidate
+                brightest = max(valid, key=lambda c: gray[c[1], c[0]])
+                px, py, radius = brightest
                 
-                # Store data with experimental time
-                time_list.append(time_arr[current_frame_index])
-                x_list.append((match_x - center_x)/pixels_per_meter)
-                y_list.append((center_y - match_y)/pixels_per_meter)
-                
-                # Update composite
-                x1 = max(0, match_x - w//2)
-                y1 = max(0, match_y - h//2)
-                x2 = min(frame_width, match_x + w//2)
-                y2 = min(frame_height, match_y + h//2)
-                composite[y1:y2, x1:x2] = cv2.addWeighted(
-                    composite[y1:y2, x1:x2], 1-alpha,
-                    frame[y1:y2, x1:x2].astype(np.float32), alpha, 0)
+                # Convert to chamber-relative coordinates
+                rel_x = (px - cx) * CALIBRATION
+                rel_y = (cy - py) * CALIBRATION  # Inverted Y-axis
+                positions.append((rel_x, rel_y))
+                frame_numbers.append(frame_idx)
 
-        # Draw tracking visualization
-        cv2.circle(display_frame, current_pos, 10, (0,0,255), -1)
-        cv2.imshow("Live Tracking", display_frame)
-        cv2.imshow("Composite", composite.astype(np.uint8))
-        if cv2.waitKey(30) & 0xFF == 27: 
-            break
+        # Visualization every 50 frames
+        if frame_idx % 30 == 0:
+            vis_frame = frame.copy()
+            if positions:
+                cv2.circle(vis_frame, (px, py), radius * 2, (0, 255, 0), 2)
+                cv2.putText(vis_frame, f"({rel_x:.2f}, {rel_y:.2f} cm)",
+                           (px + 20, py), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.imwrite(f"{output_prefix}_frame_{frame_idx:04d}.png", vis_frame)
+
+    # Analysis plots
+    if len(positions) > 1:
+        x = [p[0] for p in positions]
+        y = [p[1] for p in positions]
+        times = time_arr[frame_numbers]
+        
+        plt.figure(figsize=(15, 5))
+        
+        # Trajectory plot
+        plt.subplot(131)
+        plt.plot(x, y, '.-', markersize=3)
+        plt.gca().invert_yaxis()
+        plt.title('Trajectory in Chamber')
+        plt.xlabel('X Position (cm)')
+        plt.ylabel('Y Position (cm)')
+        plt.grid(True)
+        
+        # Vertical motion plot
+        plt.subplot(132)
+        plt.plot(times, y, '.-', markersize=3)
+        plt.gca().invert_yaxis()
+        plt.title('Vertical Motion')
+        plt.xlabel('Time (s)')
+        plt.ylabel('Y Position (cm)')
+        plt.grid(True)
+        
+        # Horizontal motion plot
+        plt.subplot(133)
+        plt.plot(times, x, '.-', markersize=3)
+        plt.title('Horizontal Motion')
+        plt.xlabel('Time (s)')
+        plt.ylabel('X Position (cm)')
+        plt.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(f"{output_prefix}_full_analysis.png")
+        plt.close()
 
     cap.release()
     cv2.destroyAllWindows()
-    cv2.imwrite(f"{output_prefix}_composite.png", composite.astype(np.uint8))
-
-    # Convert to arrays and save
-    time_array = np.array(time_list)
-    x_array = np.array(x_list)
-    y_array = np.array(y_list)
-
-    np.savez(f"{output_prefix}_results.npz",
-             time=time_array,
-             x=x_array,
-             y=y_array)
-    
-    # Generate plots
-    plt.figure(figsize=(15,5))
-    
-    plt.subplot(131)
-    plt.scatter(x_array, y_array, c=time_array, cmap='viridis')
-    plt.colorbar(label='Experimental Time (s)')
-    plt.xlabel('X Position (m)')
-    plt.ylabel('Y Position (m)')
-    plt.title('Object Trajectory')
-    
-    plt.subplot(132)
-    plt.plot(time_array, x_array)
-    plt.xlabel('Experimental Time (s)')
-    plt.ylabel('X Position (m)')
-    plt.title('X Position vs Time')
-    
-    plt.subplot(133)
-    plt.plot(time_array, y_array)
-    plt.xlabel('Experimental Time (s)')
-    plt.ylabel('Y Position (m)')
-    plt.title('Y Position vs Time')
-    
-    plt.tight_layout()
-    plt.savefig(f"{output_prefix}_plots.png")
-    plt.close()
-    
-    print(f"Processing complete for {avi_path}")
-
-##############################################################################
-#                              Main Execution                                #
-##############################################################################
-
-if __name__ == '__main__':
-    # Process single file example
-    cine_path = "Y20241101_He3kA_B250G500G_pl0t20_uw17t27_P24_y0@100_009.cine"
-    avi_path = "output_video.avi"
-    output_prefix = "tracking_results"
-    
-    # Read CINE file
-    time_arr, frame_arr = read_cine(cine_path)
-    
-    # Convert CINE to AVI
-    convert_cine_to_avi(frame_arr, avi_path)
-    
-    # Track object and save results
-    track_object(avi_path, output_prefix, time_arr)
+    print(f"Processed {len(positions)} positions")
+    return np.array(positions), np.array(times)
