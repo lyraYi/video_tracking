@@ -2,6 +2,13 @@
 #                          Video Processing Functions                        #
 ##############################################################################
 
+import cv2
+import numpy as np
+import struct
+import time
+import matplotlib.pyplot as plt
+import os
+
 def convert_cine_to_avi(frame_arr, avi_path, scale_factor=8):
     """Convert CINE frame array to AVI video"""
     orig_height, orig_width = frame_arr.shape[1], frame_arr.shape[2]
