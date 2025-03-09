@@ -4,11 +4,9 @@ import struct
 import time
 import matplotlib.pyplot as plt
 import os
-
-def track_object(avi_path, output_prefix, time_arr):
+def track_object(avi_path, output_prefix, time_arr, CALIBRATION, cx, cy, chamber_radius):
     """Track tungsten ball through entire video sequence"""
     # Constants
-    CALIBRATION = 0.038  # cm/pixel
     MIN_DIAMETER_MM = 1   # Tungsten ball diameter
     MAX_DIAMETER_MM = 3
     PIXELS_PER_METER = 100 / CALIBRATION  # Assuming CALIBRATION is in cm/pixel
@@ -17,19 +15,6 @@ def track_object(avi_path, output_prefix, time_arr):
     cap = cv2.VideoCapture(avi_path)
     if not cap.isOpened():
         raise ValueError(f"Could not open video file: {avi_path}")
-
-    # Detect chamber in first frame
-    ret, initial_frame = cap.read()
-    if not ret:
-        raise ValueError("Could not read first frame for chamber detection")
-
-    (cx, cy), chamber_radius = detect_chamber(initial_frame, PIXELS_PER_METER)
-    
-    # Save chamber visualization
-    chamber_vis = initial_frame.copy()
-    cv2.circle(chamber_vis, (cx, cy), chamber_radius, (0, 255, 0), 2)
-    cv2.imwrite(f"{output_prefix}_chamber_detection.png", chamber_vis)
-
     # Prepare tracking data structures
     positions = []
     frame_numbers = []
@@ -104,7 +89,7 @@ def track_object(avi_path, output_prefix, time_arr):
         
         # Trajectory plot
         plt.subplot(131)
-        plt.plot(x, y, '.-', markersize=3)
+        plt.scatter(x, y)
         plt.gca().invert_yaxis()
         plt.title('Trajectory in Chamber')
         plt.xlabel('X Position (cm)')
@@ -113,7 +98,7 @@ def track_object(avi_path, output_prefix, time_arr):
         
         # Vertical motion plot
         plt.subplot(132)
-        plt.plot(times, y, '.-', markersize=3)
+        plt.scatter(times, y)
         plt.gca().invert_yaxis()
         plt.title('Vertical Motion')
         plt.xlabel('Time (s)')
@@ -122,7 +107,7 @@ def track_object(avi_path, output_prefix, time_arr):
         
         # Horizontal motion plot
         plt.subplot(133)
-        plt.plot(times, x, '.-', markersize=3)
+        plt.scatter(times, x)
         plt.title('Horizontal Motion')
         plt.xlabel('Time (s)')
         plt.ylabel('X Position (cm)')
